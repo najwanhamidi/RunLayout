@@ -20,6 +20,8 @@ const state = {
     bgType: 'solid', // solid, photo, gradient, transparent
     solidBgColor: '#0a0a0d',
     gradientPreset: 'sunset',
+    photoFit: 'fit', // fit (no-crop), cover, stretch
+    photoBackdrop: 'blur', // blur, solid, black, transparent
     photoZoom: 1,
     photoPanX: 0,
     photoPanY: 0,
@@ -66,6 +68,7 @@ const state = {
     customSubtitle: '',
     runnerName: '@runner',
     locationName: '',
+    headerShowLocation: true,
     weatherText: '',
     customWatermark: '',
     metricShowHr: true,
@@ -143,7 +146,422 @@ let activeHandle = null;
 let dragStartX = 0;
 let dragStartY = 0;
 let dragInitialPos = null;
+let dragInitialPanX = 0;
+let dragInitialPanY = 0;
+let dragInitialZoom = 1;
 let isInteracting = false;
+
+// ==========================================
+// UNIVERSAL UNDO / REDO & RESTORE ENGINE
+// ==========================================
+const MAX_UNDO_STACK = 50;
+let undoStack = [];
+let redoStack = [];
+let isPerformingUndoRedo = false;
+
+function pushUndoSnapshot() {
+  if (isPerformingUndoRedo) return;
+  const snapshot = JSON.parse(JSON.stringify(state.config));
+  undoStack.push(snapshot);
+  if (undoStack.length > MAX_UNDO_STACK) {
+    undoStack.shift();
+  }
+  redoStack = [];
+  updateUndoRedoButtons();
+}
+
+function updateUndoRedoButtons() {
+  const canUndo = undoStack.length > 0;
+  const canRedo = redoStack.length > 0;
+
+  const uNav = document.getElementById('universalUndoBtn');
+  const rNav = document.getElementById('universalRedoBtn');
+  const uStage = document.getElementById('stageUndoBtn');
+  const rStage = document.getElementById('stageRedoBtn');
+
+  if (uNav) uNav.disabled = !canUndo;
+  if (rNav) rNav.disabled = !canRedo;
+  if (uStage) uStage.disabled = !canUndo;
+  if (rStage) rStage.disabled = !canRedo;
+}
+
+function undo() {
+  if (undoStack.length === 0) {
+    showToast('Nothing to undo');
+    return;
+  }
+  isPerformingUndoRedo = true;
+  const currentSnapshot = JSON.parse(JSON.stringify(state.config));
+  redoStack.push(currentSnapshot);
+  if (redoStack.length > MAX_UNDO_STACK) redoStack.shift();
+
+  const prevConfig = undoStack.pop();
+  state.config = prevConfig;
+
+  syncAllControlsWithConfig();
+  triggerRender();
+  updateGizmoBox();
+  updateUndoRedoButtons();
+  isPerformingUndoRedo = false;
+  showToast('Undo successful ↶');
+}
+
+function redo() {
+  if (redoStack.length === 0) {
+    showToast('Nothing to redo');
+    return;
+  }
+  isPerformingUndoRedo = true;
+  const currentSnapshot = JSON.parse(JSON.stringify(state.config));
+  undoStack.push(currentSnapshot);
+  if (undoStack.length > MAX_UNDO_STACK) undoStack.shift();
+
+  const nextConfig = redoStack.pop();
+  state.config = nextConfig;
+
+  syncAllControlsWithConfig();
+  triggerRender();
+  updateGizmoBox();
+  updateUndoRedoButtons();
+  isPerformingUndoRedo = false;
+  showToast('Redo successful ↷');
+}
+
+function syncAllControlsWithConfig() {
+  const cfg = state.config;
+  if (!cfg) return;
+
+  // 1. Aspect Ratio
+  const aspectPill = document.getElementById('aspectRatioPill');
+  if (aspectPill) {
+    aspectPill.textContent = ASPECT_RATIOS[cfg.aspectRatio]?.label.split(' ')[0] || cfg.aspectRatio;
+  }
+  updateActiveCard('#aspectRatioGrid', 'data-ratio', cfg.aspectRatio);
+
+  // 2. Template
+  const templateNames = {
+    'story-pro': 'Story Pro',
+    'split-focus': 'Split Focus',
+    'minimal-hud': 'Minimal HUD',
+    'stat-beast': 'Stat Beast',
+    'route-focus': 'Route Focus',
+    'lap-workout': 'Lap Workout',
+  };
+  const templatePill = document.getElementById('templatePill');
+  if (templatePill) {
+    templatePill.textContent = templateNames[cfg.template] || cfg.template;
+  }
+  updateActiveCard('#templateGrid', 'data-template', cfg.template);
+
+  // 3. Theme & Colors
+  updateActiveCard('#themeGrid', 'data-theme', cfg.theme);
+  const customColorInput = document.getElementById('customColorInput');
+  if (customColorInput && cfg.customAccentColor) {
+    customColorInput.value = cfg.customAccentColor;
+  }
+
+  // 4. Card Style & Font
+  updateActiveCard('#cardStyleGrid', 'data-cardstyle', cfg.cardStyle);
+  updateActiveCard('#fontGrid', 'data-font', cfg.fontFamily);
+
+  // 4b. Background Type & Photo
+  updateActiveCard('#bgTypeGrid', 'data-bg', cfg.bgType || 'solid');
+  const photoSection = document.getElementById('photoControlsSection');
+  if (photoSection) {
+    photoSection.style.display = cfg.bgType === 'photo' ? 'block' : 'none';
+  }
+  syncPhotoSliders();
+
+  // 5. Widget Visibility Checkboxes
+  const widgetToggles = [
+    { id: 'toggleHeader', key: 'showWidgetHeader' },
+    { id: 'toggleMap', key: 'showWidgetMap' },
+    { id: 'toggleHero', key: 'showWidgetHero' },
+    { id: 'toggleMetrics', key: 'showWidgetMetrics' },
+    { id: 'toggleSplits', key: 'showWidgetSplits' },
+    { id: 'toggleElevation', key: 'showWidgetElevation' },
+    { id: 'toggleHrZones', key: 'showWidgetHrZones' },
+    { id: 'toggleBrand', key: 'showWidgetBrand' },
+    { id: 'togglePaceGraph', key: 'showWidgetPaceGraph' },
+    { id: 'toggleHrGraph', key: 'showWidgetHrGraph' },
+    { id: 'toggleAvgHrBadge', key: 'showWidgetAvgHrBadge' },
+  ];
+  widgetToggles.forEach(({ id, key }) => {
+    const el = document.getElementById(id);
+    if (el) el.checked = cfg[key] !== false;
+  });
+
+  // 6. Metrics Checkboxes
+  const metricToggles = [
+    'metricShowHr', 'metricShowElevation', 'metricShowCadence', 'metricShowCalories', 'metricShowBestPace',
+  ];
+  metricToggles.forEach((key) => {
+    const el = document.getElementById(key);
+    if (el) el.checked = cfg[key] !== false;
+  });
+
+  // 7. Splits Tab Checkboxes
+  const splitHighlightFastest = document.getElementById('toggleFastestSplitHighlight');
+  if (splitHighlightFastest) splitHighlightFastest.checked = cfg.splitHighlightFastest !== false;
+
+  const splitWidgetTitleInput = document.getElementById('inputSplitWidgetTitle');
+  if (splitWidgetTitleInput) splitWidgetTitleInput.value = cfg.splitCustomTitle || '';
+
+  if (cfg.splitColumns) {
+    Object.entries(cfg.splitColumns).forEach(([colKey, val]) => {
+      const capKey = colKey.charAt(0).toUpperCase() + colKey.slice(1);
+      const el = document.getElementById('splitCol' + capKey);
+      if (el) el.checked = !!val;
+    });
+  }
+
+  // 8. Text Tab and Activity Inputs
+  syncInputsWithActivity(state.currentActivity);
+  renderCustomTextsList();
+
+  // 8b. Header Location Toggle Sync
+  const showLocVal = cfg.headerShowLocation !== false && cfg.showLocation !== false;
+  ['toggleHeaderLocation', 'textTabToggleHeaderLocation', 'headerShowLocationToggle'].forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) el.checked = showLocVal;
+  });
+
+  // 9. Element Inspector Sync
+  if (window.syncInspectorWithSelectedElement) {
+    window.syncInspectorWithSelectedElement(state.selectedWidget || 'header');
+  }
+
+  // 10. Dropdowns & Grids Sync
+  const setSelectVal = (id, val) => {
+    const el = document.getElementById(id);
+    if (el && val !== undefined && val !== null) el.value = val;
+  };
+  setSelectVal('headerDesignSelect', cfg.headerTemplate || cfg.headerDesign);
+  setSelectVal('mapDesignSelect', cfg.mapDesign);
+  setSelectVal('heroMetricSelect', cfg.heroMetric);
+  setSelectVal('heroDesignSelect', cfg.heroDesign);
+  setSelectVal('metricsDesignSelect', cfg.metricsDesign);
+  setSelectVal('splitWidgetModeSelect', cfg.splitWidgetMode);
+  setSelectVal('splitsDesignSelect', cfg.splitsDesign);
+  setSelectVal('splitHighlightDesignSelect', cfg.splitHighlightDesign);
+  setSelectVal('elevationDesignSelect', cfg.elevationDesign);
+  setSelectVal('paceGraphDesignSelect', cfg.paceGraphDesign);
+  setSelectVal('hrGraphDesignSelect', cfg.hrGraphDesign);
+  setSelectVal('hrBadgeDesignSelect', cfg.hrBadgeDesign);
+  setSelectVal('brandStyleSelect', cfg.brandStyle);
+  setSelectVal('splitIntervalSelect', cfg.splitInterval);
+
+  updateActiveCard('#splitSourceGrid', 'data-source', cfg.splitDataSource || 'auto');
+  updateActiveCard('#splitWidgetModeGrid', 'data-mode', cfg.splitWidgetMode || 'bars');
+  updateActiveCard('#headerTemplateGrid', 'data-template', cfg.headerTemplate || cfg.headerDesign || 'modern');
+}
+
+function deleteSelectedTarget(targetKey = null) {
+  const key = targetKey || state.selectedWidget;
+  if (!key) {
+    showToast('No element selected to delete');
+    return;
+  }
+  pushUndoSnapshot();
+
+  // 1. Check if it's a custom text sticker
+  const cIdx = state.config.customTexts.findIndex((t) => t.id === key);
+  if (cIdx !== -1) {
+    state.config.customTexts.splice(cIdx, 1);
+    selectWidget(null);
+    renderCustomTextsList();
+    triggerRender();
+    showToast('Deleted text sticker');
+    return;
+  }
+
+  // 2. Check if it's a background border (_bg)
+  if (key.endsWith('_bg')) {
+    const baseKey = key.replace(/_bg$/, '');
+    if (!state.config.widgetBgStyles) state.config.widgetBgStyles = {};
+    if (!state.config.widgetBgStyles[baseKey]) state.config.widgetBgStyles[baseKey] = {};
+    state.config.widgetBgStyles[baseKey].visible = false;
+    state.config.widgetBgStyles[baseKey].hidden = true;
+    state.config.widgetBgStyles[baseKey].showBg = false;
+    state.config.widgetBgStyles[baseKey].showBorder = false;
+    selectWidget(baseKey);
+    if (window.syncInspectorWithSelectedElement) {
+      window.syncInspectorWithSelectedElement(baseKey, 'bg');
+    }
+    triggerRender();
+    showToast(`Deleted background border for ${baseKey}`);
+    return;
+  }
+
+  // 3. Check if inspector has a sub-part selected for this widget
+  const subPartSelect = document.getElementById('inspectorSubPartSelect');
+  const currentPart = subPartSelect ? subPartSelect.value : 'widget';
+  if (currentPart !== 'widget' && currentPart !== 'bg' && subPartSelect) {
+    if (!state.config.widgetElementOffsets) state.config.widgetElementOffsets = {};
+    if (!state.config.widgetElementOffsets[key]) state.config.widgetElementOffsets[key] = {};
+    if (!state.config.widgetElementOffsets[key][currentPart]) {
+      state.config.widgetElementOffsets[key][currentPart] = { x: 0, y: 0, z: 1 };
+    }
+    state.config.widgetElementOffsets[key][currentPart].hidden = true;
+    state.config.widgetElementOffsets[key][currentPart].visible = false;
+    if (key === 'header' && currentPart === 'location') {
+      state.config.headerShowLocation = false;
+      state.config.showLocation = false;
+      ['toggleHeaderLocation', 'textTabToggleHeaderLocation', 'headerShowLocationToggle'].forEach((id) => {
+        const el = document.getElementById(id);
+        if (el) el.checked = false;
+      });
+    }
+    triggerRender();
+    showToast(`Deleted / hid ${currentPart} in ${key}`);
+    return;
+  }
+
+  // 4. Default: Delete (hide) the entire widget
+  const showKey = 'showWidget' + key.charAt(0).toUpperCase() + key.slice(1);
+  if (showKey in state.config) {
+    state.config[showKey] = false;
+    const widgetCheckbox = document.getElementById(showKey) || document.getElementById('toggle' + key.charAt(0).toUpperCase() + key.slice(1));
+    if (widgetCheckbox) widgetCheckbox.checked = false;
+    selectWidget(null);
+    triggerRender();
+    showToast(`Deleted ${key} widget`);
+  } else {
+    selectWidget(null);
+    triggerRender();
+    showToast(`Deselected ${key}`);
+  }
+}
+
+function restoreWidgetToTemplate(targetKey = null) {
+  const key = targetKey || state.selectedWidget;
+  if (!key) {
+    showToast('Select a widget to restore');
+    return;
+  }
+  pushUndoSnapshot();
+
+  const baseKey = key.replace(/_bg$/, '');
+
+  // Reset custom position & size
+  if (state.config.widgetPositions && state.config.widgetPositions[baseKey]) {
+    delete state.config.widgetPositions[baseKey];
+  }
+
+  // Reset custom border styles (offset, size, radius, stroke, visibility, textOnly)
+  if (state.config.widgetBgStyles && state.config.widgetBgStyles[baseKey]) {
+    delete state.config.widgetBgStyles[baseKey];
+  }
+
+  // Reset custom sub-element offsets & hidden states
+  if (state.config.widgetElementOffsets && state.config.widgetElementOffsets[baseKey]) {
+    delete state.config.widgetElementOffsets[baseKey];
+  }
+
+  // Reset custom styling (font, sizeScale, color, accentColor, cardStyle, textAlign)
+  if (state.config.elementStyles && state.config.elementStyles[baseKey]) {
+    delete state.config.elementStyles[baseKey];
+  }
+
+  // Reset custom text overrides
+  if (state.config.widgetTextOverrides && state.config.widgetTextOverrides[baseKey]) {
+    delete state.config.widgetTextOverrides[baseKey];
+  }
+
+  // Widget specific reset
+  if (baseKey === 'header') {
+    state.config.customTitle = '';
+    state.config.customSubtitle = '';
+    state.config.runnerName = '@runner';
+    state.config.locationName = '';
+    state.config.weatherText = '';
+    state.config.headerShowLocation = true;
+    state.config.showLocation = true;
+    ['toggleHeaderLocation', 'textTabToggleHeaderLocation', 'headerShowLocationToggle'].forEach((id) => {
+      const el = document.getElementById(id);
+      if (el) el.checked = true;
+    });
+    syncInputsWithActivity(state.currentActivity);
+  } else if (baseKey === 'splits') {
+    state.config.splitCustomTitle = '';
+    state.config.splitHighlightFastest = true;
+    state.config.splitColumns = {
+      split: true,
+      time: true,
+      pace: true,
+      delta: true,
+      avgHr: true,
+      maxHr: false,
+      minHr: false,
+      cadence: false,
+      elevation: true,
+    };
+  }
+
+  // Ensure widget is enabled / visible
+  const showKey = 'showWidget' + baseKey.charAt(0).toUpperCase() + baseKey.slice(1);
+  if (showKey in state.config) {
+    state.config[showKey] = true;
+    const widgetCheckbox = document.getElementById(showKey) || document.getElementById('toggle' + baseKey.charAt(0).toUpperCase() + baseKey.slice(1));
+    if (widgetCheckbox) widgetCheckbox.checked = true;
+  }
+
+  // Re-sync UI controls and inspector
+  syncAllControlsWithConfig();
+  if (window.syncInspectorWithSelectedElement) {
+    window.syncInspectorWithSelectedElement(baseKey, 'widget');
+  }
+  selectWidget(baseKey);
+  triggerRender();
+  showToast(`Restored ${baseKey} to original template design`);
+}
+
+function setupUndoRedoControls() {
+  const uNav = document.getElementById('universalUndoBtn');
+  const rNav = document.getElementById('universalRedoBtn');
+  const uStage = document.getElementById('stageUndoBtn');
+  const rStage = document.getElementById('stageRedoBtn');
+
+  if (uNav) uNav.addEventListener('click', undo);
+  if (rNav) rNav.addEventListener('click', redo);
+  if (uStage) uStage.addEventListener('click', undo);
+  if (rStage) rStage.addEventListener('click', redo);
+
+  updateUndoRedoButtons();
+}
+
+function setupKeyboardShortcuts() {
+  window.addEventListener('keydown', (e) => {
+    const isInputActive = ['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName);
+
+    // Ctrl+Z / Cmd+Z for Undo
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
+      if (e.shiftKey) {
+        e.preventDefault();
+        redo();
+      } else {
+        e.preventDefault();
+        undo();
+      }
+      return;
+    }
+
+    // Ctrl+Y / Cmd+Y for Redo
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y') {
+      e.preventDefault();
+      redo();
+      return;
+    }
+
+    // Delete / Backspace key when a widget is selected (and not editing text)
+    if ((e.key === 'Delete' || e.key === 'Backspace') && !isInputActive) {
+      if (state.selectedWidget) {
+        e.preventDefault();
+        deleteSelectedTarget(state.selectedWidget);
+      }
+    }
+  });
+}
 
 // ==========================================
 // WORKSPACE PREVIEW ZOOM CONTROLLER
@@ -278,6 +696,7 @@ function init() {
   setupNavigationTabs();
   setupActivityControls();
   setupFormatControls();
+  setupSavedTemplatesControls();
   setupZoomControls();
   setupSplitsControls();
   setupWidgetsControls();
@@ -287,11 +706,17 @@ function init() {
   setupStyleControls();
   setupExportControls();
   setupGizmoController();
+  setupUndoRedoControls();
+  setupKeyboardShortcuts();
 
   // 3. Populate Splits UI
   updateSplitsDropdownAndTable();
 
   // 4. Initial Render
+  window.state = state;
+  window.renderer = renderer;
+  window.selectWidget = selectWidget;
+  window.triggerRender = triggerRender;
   triggerRender();
 }
 
@@ -429,8 +854,20 @@ function syncInputsWithActivity(act) {
 function setupFormatControls() {
   // Aspect Ratios
   setupCardGrid('#aspectRatioGrid', 'data-ratio', (ratio) => {
+    pushUndoSnapshot();
     state.config.aspectRatio = ratio;
     document.getElementById('aspectRatioPill').textContent = ASPECT_RATIOS[ratio]?.label.split(' ')[0] || ratio;
+    if (renderer.bgImage && state.config.bgType === 'photo') {
+      const img = renderer.bgImage;
+      const imgAspect = img.width / img.height;
+      const [rw, rh] = ratio.split(':').map(Number);
+      const canvasAspect = (rw && rh) ? rw / rh : 9 / 16;
+      const isRatioSimilar = Math.abs(imgAspect - canvasAspect) / Math.max(imgAspect, canvasAspect) < 0.05;
+      if (!isRatioSimilar && state.config.photoFit !== 'cover') {
+        state.config.photoFit = 'fit';
+      }
+      syncPhotoSliders();
+    }
     triggerRender();
   });
 
@@ -448,6 +885,414 @@ function setupFormatControls() {
     document.getElementById('templatePill').textContent = templateNames[template] || template;
     triggerRender();
   });
+}
+
+// ==========================================
+// 3b. SAVED CUSTOM TEMPLATES CONTROLS
+// ==========================================
+const TEMPLATES_STORAGE_KEY = 'runoverlay_custom_templates';
+
+function escapeHtml(str) {
+  if (!str) return '';
+  return String(str)
+    .split('&').join('&amp;')
+    .split('<').join('&lt;')
+    .split('>').join('&gt;')
+    .split('"').join('&quot;')
+    .split("'").join('&#039;');
+}
+
+function getSavedTemplates() {
+  try {
+    const raw = localStorage.getItem(TEMPLATES_STORAGE_KEY);
+    if (!raw) return [];
+    const list = JSON.parse(raw);
+    return Array.isArray(list) ? list : [];
+  } catch (e) {
+    console.error('Failed to parse saved templates:', e);
+    return [];
+  }
+}
+
+function saveTemplatesToStorage(templates) {
+  try {
+    localStorage.setItem(TEMPLATES_STORAGE_KEY, JSON.stringify(templates));
+  } catch (e) {
+    console.error('Failed to save templates to storage:', e);
+    showToast('Failed to save to local storage');
+  }
+}
+
+function extractTemplateConfig(cfg) {
+  return {
+    aspectRatio: cfg.aspectRatio || '9:16',
+    template: cfg.template || 'story-pro',
+    theme: cfg.theme || 'cyber',
+    customAccentColor: cfg.customAccentColor || null,
+
+    // Background & styling
+    bgType: cfg.bgType || 'solid',
+    bgColor1: cfg.bgColor1 || '#0a0a0d',
+    bgColor2: cfg.bgColor2 || '#13131a',
+    bgGradientAngle: cfg.bgGradientAngle || 180,
+    photoFit: cfg.photoFit || 'fit',
+    photoZoom: typeof cfg.photoZoom === 'number' ? cfg.photoZoom : 1,
+    photoPanX: typeof cfg.photoPanX === 'number' ? cfg.photoPanX : 0,
+    photoPanY: typeof cfg.photoPanY === 'number' ? cfg.photoPanY : 0,
+    photoBlur: typeof cfg.photoBlur === 'number' ? cfg.photoBlur : 0,
+    cardStyle: cfg.cardStyle || 'glass',
+    cardRadius: typeof cfg.cardRadius === 'number' ? cfg.cardRadius : 16,
+    fontFamily: cfg.fontFamily || 'Inter',
+    mapGlow: cfg.mapGlow !== false,
+
+    // Enabled widgets
+    showWidgetHeader: cfg.showWidgetHeader !== false,
+    showWidgetMap: cfg.showWidgetMap !== false,
+    showWidgetHero: cfg.showWidgetHero !== false,
+    showWidgetMetrics: cfg.showWidgetMetrics !== false,
+    showWidgetSplits: cfg.showWidgetSplits !== false,
+    showWidgetElevation: cfg.showWidgetElevation !== false,
+    showWidgetHrZones: cfg.showWidgetHrZones !== false,
+    showWidgetBrand: cfg.showWidgetBrand !== false,
+    showWidgetPaceGraph: cfg.showWidgetPaceGraph !== false,
+    showWidgetHrGraph: cfg.showWidgetHrGraph !== false,
+    showWidgetAvgHrBadge: cfg.showWidgetAvgHrBadge !== false,
+
+    // Metric items
+    metricShowHr: cfg.metricShowHr !== false,
+    metricShowElevation: cfg.metricShowElevation !== false,
+    metricShowCadence: cfg.metricShowCadence !== false,
+    metricShowCalories: cfg.metricShowCalories !== false,
+    metricShowBestPace: cfg.metricShowBestPace !== false,
+
+    // Widget designs
+    headerTemplate: cfg.headerTemplate || cfg.headerDesign || 'modern',
+    headerDesign: cfg.headerDesign || cfg.headerTemplate || 'modern',
+    heroMetric: cfg.heroMetric || 'distance',
+    heroDesign: cfg.heroDesign || 'mega',
+    metricsDesign: cfg.metricsDesign || 'grid',
+    splitWidgetMode: cfg.splitWidgetMode || 'bars',
+    splitsDesign: cfg.splitsDesign || 'vertical-bars',
+    splitHighlightDesign: cfg.splitHighlightDesign || 'spotlight',
+    elevationDesign: cfg.elevationDesign || 'area',
+    paceGraphDesign: cfg.paceGraphDesign || 'area',
+    hrGraphDesign: cfg.hrGraphDesign || 'filled-area',
+    hrBadgeDesign: cfg.hrBadgeDesign || 'pill',
+    brandStyle: cfg.brandStyle || 'strava',
+    mapDesign: cfg.mapDesign || 'glow',
+
+    // Splits configuration
+    splitInterval: cfg.splitInterval || 1000,
+    splitDataSource: cfg.splitDataSource || 'auto',
+    splitHighlightFastest: cfg.splitHighlightFastest !== false,
+    splitCustomTitle: cfg.splitCustomTitle || '',
+    splitColumns: cfg.splitColumns ? JSON.parse(JSON.stringify(cfg.splitColumns)) : {},
+
+    // Text overrides & label customizations
+    headerShowLocation: cfg.headerShowLocation !== false,
+    showLocation: cfg.showLocation !== false,
+    customTitle: cfg.customTitle || '',
+    customSubtitle: cfg.customSubtitle || '',
+    runnerName: cfg.runnerName || '',
+    locationName: cfg.locationName || '',
+    weatherText: cfg.weatherText || '',
+    customWatermark: cfg.customWatermark || '',
+    labelDistance: cfg.labelDistance || '',
+    labelTime: cfg.labelTime || '',
+    labelPace: cfg.labelPace || '',
+    labelHr: cfg.labelHr || '',
+    labelElevation: cfg.labelElevation || '',
+    labelCadence: cfg.labelCadence || '',
+    widgetTextOverrides: cfg.widgetTextOverrides ? JSON.parse(JSON.stringify(cfg.widgetTextOverrides)) : {},
+    customTexts: cfg.customTexts ? JSON.parse(JSON.stringify(cfg.customTexts)) : [],
+
+    // Individual Positioning, Backgrounds, and Sub-Parts
+    widgetPositions: cfg.widgetPositions ? JSON.parse(JSON.stringify(cfg.widgetPositions)) : {},
+    widgetBgStyles: cfg.widgetBgStyles ? JSON.parse(JSON.stringify(cfg.widgetBgStyles)) : {},
+    widgetElementOffsets: cfg.widgetElementOffsets ? JSON.parse(JSON.stringify(cfg.widgetElementOffsets)) : {},
+    elementStyles: cfg.elementStyles ? JSON.parse(JSON.stringify(cfg.elementStyles)) : {},
+  };
+}
+
+function saveCurrentTemplate(customName = null) {
+  const nameInput = document.getElementById('saveTemplateNameInput');
+  let name = (customName || (nameInput ? nameInput.value : '')).trim();
+
+  if (!name) {
+    const themeName = state.config.theme ? (state.config.theme.charAt(0).toUpperCase() + state.config.theme.slice(1)) : 'Custom';
+    const dateStr = new Date().toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+    name = `${themeName} ${state.config.aspectRatio || '9:16'} (${dateStr})`;
+  }
+
+  const templates = getSavedTemplates();
+  const newTemplate = {
+    id: 'tpl_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5),
+    name: name,
+    createdAt: new Date().toISOString(),
+    aspectRatio: state.config.aspectRatio || '9:16',
+    theme: state.config.theme || 'cyber',
+    config: extractTemplateConfig(state.config),
+  };
+
+  templates.unshift(newTemplate);
+  saveTemplatesToStorage(templates);
+  if (nameInput) nameInput.value = '';
+
+  renderSavedTemplatesList();
+  showToast(`Template "${name}" saved! 💾`);
+  return newTemplate;
+}
+
+function applyCustomTemplate(templateId) {
+  const templates = getSavedTemplates();
+  const tpl = templates.find((t) => t.id === templateId);
+  if (!tpl || !tpl.config) {
+    showToast('Template not found');
+    return;
+  }
+
+  pushUndoSnapshot();
+
+  const c = tpl.config;
+  Object.keys(c).forEach((key) => {
+    if (typeof c[key] === 'object' && c[key] !== null) {
+      state.config[key] = JSON.parse(JSON.stringify(c[key]));
+    } else {
+      state.config[key] = c[key];
+    }
+  });
+
+  syncAllControlsWithConfig();
+  triggerRender();
+  updateGizmoBox();
+  renderSavedTemplatesList();
+
+  showToast(`Applied template "${tpl.name}"! ⚡`);
+}
+
+function deleteCustomTemplate(templateId) {
+  const templates = getSavedTemplates();
+  const tpl = templates.find((t) => t.id === templateId);
+  const name = tpl ? tpl.name : 'template';
+  if (!confirm(`Are you sure you want to delete template "${name}"?`)) return;
+
+  const filtered = templates.filter((t) => t.id !== templateId);
+  saveTemplatesToStorage(filtered);
+  renderSavedTemplatesList();
+  showToast(`Deleted template "${name}"`);
+}
+
+function renameCustomTemplate(templateId) {
+  const templates = getSavedTemplates();
+  const tpl = templates.find((t) => t.id === templateId);
+  if (!tpl) return;
+  const newName = prompt('Enter new template name:', tpl.name);
+  if (newName && newName.trim()) {
+    tpl.name = newName.trim();
+    saveTemplatesToStorage(templates);
+    renderSavedTemplatesList();
+    showToast('Template renamed');
+  }
+}
+
+function exportSingleTemplate(templateId) {
+  const templates = getSavedTemplates();
+  const tpl = templates.find((t) => t.id === templateId);
+  if (!tpl) return;
+
+  const jsonStr = JSON.stringify(tpl, null, 2);
+  const blob = new Blob([jsonStr], { type: 'application/json' });
+  const filename = `${tpl.name.toLowerCase().replace(/[^a-z0-9_-]/g, '_')}_template.json`;
+  downloadBlob(blob, filename);
+  showToast(`Exported "${tpl.name}" to JSON`);
+}
+
+function exportAllTemplates() {
+  const templates = getSavedTemplates();
+  if (templates.length === 0) {
+    showToast('No saved templates to export');
+    return;
+  }
+
+  const jsonStr = JSON.stringify(templates, null, 2);
+  const blob = new Blob([jsonStr], { type: 'application/json' });
+  downloadBlob(blob, 'runoverlay_saved_templates_backup.json');
+  showToast(`Exported ${templates.length} template(s) to backup file`);
+}
+
+function importTemplatesFromFile(file) {
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    try {
+      const data = JSON.parse(e.target.result);
+      const incoming = Array.isArray(data) ? data : [data];
+      const valid = incoming.filter((item) => item && (item.config || item.aspectRatio || item.name));
+      if (valid.length === 0) {
+        showToast('Invalid template file format');
+        return;
+      }
+
+      const templates = getSavedTemplates();
+      valid.forEach((t) => {
+        templates.unshift({
+          id: 'tpl_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5),
+          name: t.name || 'Imported Template',
+          createdAt: t.createdAt || new Date().toISOString(),
+          aspectRatio: t.aspectRatio || (t.config && t.config.aspectRatio) || '9:16',
+          theme: t.theme || (t.config && t.config.theme) || 'cyber',
+          config: t.config || extractTemplateConfig(t),
+        });
+      });
+
+      saveTemplatesToStorage(templates);
+      renderSavedTemplatesList();
+      showToast(`Imported ${valid.length} template(s) successfully! 📥`);
+
+      if (valid.length > 0) {
+        applyCustomTemplate(templates[0].id);
+      }
+    } catch (err) {
+      console.error(err);
+      showToast('Error reading template file: ' + err.message);
+    }
+  };
+  reader.readAsText(file);
+}
+
+function renderSavedTemplatesList() {
+  const container = document.getElementById('savedTemplatesList');
+  const countBadge = document.getElementById('savedTemplatesCount');
+  if (!container) return;
+
+  const templates = getSavedTemplates();
+  if (countBadge) countBadge.textContent = `${templates.length} Saved`;
+
+  if (templates.length === 0) {
+    container.innerHTML = `
+      <div style="text-align: center; padding: 18px 12px; background: rgba(255,255,255,0.02); border: 1px dashed var(--border-subtle); border-radius: 8px; color: var(--text-muted); font-size: 0.78rem;">
+        <div style="font-size: 1.5rem; margin-bottom: 6px;">📐</div>
+        <div style="font-weight: 600; color: #fff; margin-bottom: 2px;">No Saved Templates Yet</div>
+        <div>Customize your widgets, colors, and layout, then enter a name above to save your first reusable template!</div>
+      </div>
+    `;
+    return;
+  }
+
+  container.innerHTML = '';
+  templates.forEach((tpl) => {
+    const card = document.createElement('div');
+    card.className = 'saved-template-card';
+    card.style.cssText = 'background: var(--bg-card); border: 1px solid var(--border-subtle); border-radius: 10px; padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; transition: all 0.2s;';
+
+    const dateStr = tpl.createdAt ? new Date(tpl.createdAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '';
+
+    card.innerHTML = `
+      <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 8px;">
+        <div style="flex: 1; min-width: 0;">
+          <div style="font-weight: 700; font-size: 0.88rem; color: #fff; display: flex; align-items: center; gap: 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
+            <span>⚡</span>
+            <span class="template-name-text">${escapeHtml(tpl.name)}</span>
+            <button type="button" class="btn-rename-template" data-id="${tpl.id}" style="background:none; border:none; color:var(--text-muted); cursor:pointer; font-size:0.72rem; padding:0 2px;" title="Rename template">✏️</button>
+          </div>
+          <div style="display: flex; gap: 6px; align-items: center; margin-top: 4px; flex-wrap: wrap;">
+            <span style="font-size: 0.68rem; padding: 1px 6px; border-radius: 4px; background: rgba(204,255,0,0.12); color: var(--accent-volt); font-weight: 700;">${tpl.aspectRatio || '9:16'}</span>
+            <span style="font-size: 0.68rem; padding: 1px 6px; border-radius: 4px; background: rgba(56,189,248,0.12); color: #38bdf8; font-weight: 700;">${(tpl.theme || 'CYBER').toUpperCase()}</span>
+            <span style="font-size: 0.68rem; color: var(--text-muted);">${dateStr}</span>
+          </div>
+        </div>
+        <div style="display: flex; gap: 4px; align-items: center; flex-shrink: 0;">
+          <button type="button" class="btn btn-primary btn-apply-template" data-id="${tpl.id}" style="padding: 4px 10px; font-size: 0.75rem; font-weight: 700;" title="Load and apply this template">
+            Apply ⚡
+          </button>
+          <button type="button" class="btn btn-secondary btn-export-template" data-id="${tpl.id}" style="padding: 4px 8px; font-size: 0.72rem;" title="Download template JSON file">
+            💾
+          </button>
+          <button type="button" class="btn btn-secondary btn-delete-template" data-id="${tpl.id}" style="padding: 4px 8px; font-size: 0.72rem; color: #f87171;" title="Delete this template">
+            🗑️
+          </button>
+        </div>
+      </div>
+    `;
+
+    card.querySelector('.btn-apply-template').addEventListener('click', () => applyCustomTemplate(tpl.id));
+    card.querySelector('.btn-export-template').addEventListener('click', () => exportSingleTemplate(tpl.id));
+    card.querySelector('.btn-delete-template').addEventListener('click', () => deleteCustomTemplate(tpl.id));
+    card.querySelector('.btn-rename-template').addEventListener('click', () => renameCustomTemplate(tpl.id));
+
+    container.appendChild(card);
+  });
+}
+
+function setupSavedTemplatesControls() {
+  const saveBtn = document.getElementById('saveCurrentTemplateBtn');
+  const nameInput = document.getElementById('saveTemplateNameInput');
+  const stageSaveBtn = document.getElementById('stageSaveTemplateBtn');
+  const importBtn = document.getElementById('importTemplateBtn');
+  const fileInput = document.getElementById('importTemplateFileInput');
+  const exportAllBtn = document.getElementById('exportAllTemplatesBtn');
+
+  if (saveBtn) {
+    saveBtn.addEventListener('click', () => saveCurrentTemplate());
+  }
+
+  if (nameInput) {
+    nameInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        saveCurrentTemplate();
+      }
+    });
+  }
+
+  if (stageSaveBtn) {
+    stageSaveBtn.addEventListener('click', () => {
+      const formatTabBtn = document.querySelector('.tab-btn[data-tab="formatTab"]');
+      if (formatTabBtn) formatTabBtn.click();
+
+      const input = document.getElementById('saveTemplateNameInput');
+      const box = document.getElementById('saveTemplateFormBox');
+      if (input) {
+        input.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        input.focus();
+      }
+      if (box) {
+        box.style.borderColor = 'var(--accent-volt)';
+        box.style.boxShadow = '0 0 16px rgba(204, 255, 0, 0.3)';
+        setTimeout(() => {
+          box.style.borderColor = 'var(--border-subtle)';
+          box.style.boxShadow = 'none';
+        }, 1500);
+      }
+      showToast('Enter template name and click Save 💾');
+    });
+  }
+
+  if (importBtn && fileInput) {
+    importBtn.addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', (e) => {
+      if (e.target.files.length > 0) {
+        importTemplatesFromFile(e.target.files[0]);
+        e.target.value = '';
+      }
+    });
+  }
+
+  if (exportAllBtn) {
+    exportAllBtn.addEventListener('click', exportAllTemplates);
+  }
+
+  // Initial render from localStorage
+  renderSavedTemplatesList();
+
+  // Expose on window for tests and console
+  window.saveCurrentTemplate = saveCurrentTemplate;
+  window.applyCustomTemplate = applyCustomTemplate;
+  window.getSavedTemplates = getSavedTemplates;
+  window.renderSavedTemplatesList = renderSavedTemplatesList;
+  window.importTemplatesFromFile = importTemplatesFromFile;
+  window.exportSingleTemplate = exportSingleTemplate;
+  window.exportAllTemplates = exportAllTemplates;
 }
 
 // ==========================================
@@ -742,6 +1587,7 @@ function setupWidgetsControls() {
     const el = document.getElementById(id);
     if (el) {
       el.addEventListener('change', (e) => {
+        pushUndoSnapshot();
         state.config[key] = e.target.value;
         triggerRender();
       });
@@ -750,6 +1596,7 @@ function setupWidgetsControls() {
 
   // Hero metric choice
   setupCardGrid('#heroMetricGrid', 'data-hero', (hero) => {
+    pushUndoSnapshot();
     state.config.heroMetric = hero;
     triggerRender();
   });
@@ -782,6 +1629,7 @@ function setupWidgetsControls() {
   if (resetPosBtn) {
     resetPosBtn.addEventListener('click', () => {
       if (state.selectedWidget) {
+        pushUndoSnapshot();
         delete state.config.widgetPositions[state.selectedWidget];
         triggerRender();
         showToast('Reset widget to template default');
@@ -793,6 +1641,7 @@ function setupWidgetsControls() {
   if (centerBtn) {
     centerBtn.addEventListener('click', () => {
       if (state.selectedWidget) {
+        pushUndoSnapshot();
         centerWidget(state.selectedWidget);
       }
     });
@@ -807,6 +1656,7 @@ function setupHeaderTemplateControls() {
   const select = document.getElementById('headerDesignSelect');
 
   const setHeaderTemplate = (template) => {
+    pushUndoSnapshot();
     state.config.headerTemplate = template;
     state.config.headerDesign = template;
 
@@ -879,7 +1729,14 @@ function setupElementInspectorControls() {
   const subElemYInput = document.getElementById('inspectorSubElemYInput');
   const subElemZSlider = document.getElementById('inspectorSubElemZSlider');
   const subElemZInput = document.getElementById('inspectorSubElemZInput');
+  const subElemFontFamily = document.getElementById('inspectorSubElemFontFamily');
+  const subElemSizeSlider = document.getElementById('inspectorSubElemSizeSlider');
+  const subElemSizeInput = document.getElementById('inspectorSubElemSizeInput');
+  const subElemSizeVal = document.getElementById('inspectorSubElemSizeVal');
   const subElemTextInput = document.getElementById('inspectorSubElemTextInput');
+  const subElemColorInput = document.getElementById('inspectorSubElemColorInput');
+  const subElemColorHex = document.getElementById('inspectorSubElemColorHex');
+  const subElemColorResetBtn = document.getElementById('inspectorSubElemColorResetBtn');
   const resetSubElemBtn = document.getElementById('inspectorResetSubElemBtn');
 
   const fontSelect = document.getElementById('inspectorFontFamily');
@@ -1046,6 +1903,11 @@ function setupElementInspectorControls() {
       if (bgBorderColorInput && bColor.startsWith('#')) bgBorderColorInput.value = bColor;
       if (bgFillColorHex) bgFillColorHex.value = fColor;
       if (bgFillColorInput && fColor.startsWith('#')) bgFillColorInput.value = fColor;
+
+      const bgShowBgToggle = document.getElementById('inspectorBgShowBgToggle');
+      const bgShowBorderToggle = document.getElementById('inspectorBgShowBorderToggle');
+      if (bgShowBgToggle) bgShowBgToggle.checked = bgStyle.showBg !== false && !bgStyle.textOnly;
+      if (bgShowBorderToggle) bgShowBorderToggle.checked = bgStyle.showBorder !== false && !bgStyle.textOnly;
     } else if (currentPart !== 'widget') {
       if (bgControlsContainer) bgControlsContainer.style.display = 'none';
       if (subElemControlsContainer) subElemControlsContainer.style.display = 'block';
@@ -1066,6 +1928,12 @@ function setupElementInspectorControls() {
       if (subElemZSlider) subElemZSlider.value = oz;
       if (subElemZInput) subElemZInput.value = oz;
 
+      if (subElemFontFamily) subElemFontFamily.value = off.fontFamily || 'default';
+      const sScale = typeof off.scale === 'number' && !isNaN(off.scale) ? off.scale : 100;
+      if (subElemSizeSlider) subElemSizeSlider.value = sScale;
+      if (subElemSizeInput) subElemSizeInput.value = sScale;
+      if (subElemSizeVal) subElemSizeVal.textContent = `${sScale}%`;
+
       // Populate text input
       if (subElemTextInput) {
         let currentText = '';
@@ -1081,6 +1949,17 @@ function setupElementInspectorControls() {
           if (targetKey === 'splits' && currentPart === 'title') currentText = state.config.splitCustomTitle || '';
         }
         subElemTextInput.value = currentText;
+      }
+
+      // Populate text color
+      const currentColor = (off.color && off.color !== 'default') ? off.color : '';
+      if (subElemColorHex) subElemColorHex.value = currentColor;
+      if (subElemColorInput) {
+        if (currentColor && currentColor.startsWith('#')) {
+          subElemColorInput.value = currentColor;
+        } else {
+          subElemColorInput.value = '#ffffff';
+        }
       }
     } else {
       if (bgControlsContainer) bgControlsContainer.style.display = 'none';
@@ -1588,6 +2467,36 @@ function setupElementInspectorControls() {
   bindSubElemSliderInput(subElemYSlider, subElemYInput, 'y');
   bindSubElemSliderInput(subElemZSlider, subElemZInput, 'z');
 
+  if (subElemFontFamily) {
+    subElemFontFamily.addEventListener('change', (e) => {
+      pushUndoSnapshot();
+      getSubElemObj().fontFamily = e.target.value;
+      triggerRender();
+    });
+  }
+
+  if (subElemSizeSlider) {
+    subElemSizeSlider.addEventListener('input', (e) => {
+      const val = parseInt(e.target.value, 10) || 100;
+      if (subElemSizeInput) subElemSizeInput.value = val;
+      if (subElemSizeVal) subElemSizeVal.textContent = `${val}%`;
+      getSubElemObj().scale = val;
+      triggerRender();
+    });
+    subElemSizeSlider.addEventListener('change', () => pushUndoSnapshot());
+  }
+
+  if (subElemSizeInput) {
+    subElemSizeInput.addEventListener('input', (e) => {
+      const val = parseInt(e.target.value, 10) || 100;
+      if (subElemSizeSlider) subElemSizeSlider.value = val;
+      if (subElemSizeVal) subElemSizeVal.textContent = `${val}%`;
+      getSubElemObj().scale = val;
+      triggerRender();
+    });
+    subElemSizeInput.addEventListener('change', () => pushUndoSnapshot());
+  }
+
   if (subElemTextInput) {
     subElemTextInput.addEventListener('input', (e) => {
       const val = e.target.value;
@@ -1609,16 +2518,144 @@ function setupElementInspectorControls() {
     });
   }
 
+  if (subElemColorInput) {
+    subElemColorInput.addEventListener('input', (e) => {
+      pushUndoSnapshot();
+      const val = e.target.value;
+      if (subElemColorHex) subElemColorHex.value = val;
+      getSubElemObj().color = val;
+      triggerRender();
+    });
+  }
+
+  if (subElemColorHex) {
+    subElemColorHex.addEventListener('input', (e) => {
+      const val = e.target.value.trim();
+      const obj = getSubElemObj();
+      if (!val || val.toLowerCase() === 'default' || val.toLowerCase() === 'inherit') {
+        obj.color = 'default';
+      } else {
+        obj.color = val;
+        if (val.startsWith('#') && (val.length === 7 || val.length === 4) && subElemColorInput) {
+          subElemColorInput.value = val;
+        }
+      }
+      triggerRender();
+    });
+    subElemColorHex.addEventListener('change', () => pushUndoSnapshot());
+  }
+
+  if (subElemColorResetBtn) {
+    subElemColorResetBtn.addEventListener('click', () => {
+      pushUndoSnapshot();
+      const obj = getSubElemObj();
+      obj.color = 'default';
+      if (subElemColorHex) subElemColorHex.value = '';
+      if (subElemColorInput) subElemColorInput.value = '#ffffff';
+      triggerRender();
+      showToast('Item text color reset to inherit default');
+    });
+  }
+
   if (resetSubElemBtn) {
     resetSubElemBtn.addEventListener('click', () => {
+      pushUndoSnapshot();
       const key = getActiveKey();
       const part = subPartSelect ? subPartSelect.value : '';
       if (state.config.widgetElementOffsets && state.config.widgetElementOffsets[key] && state.config.widgetElementOffsets[key][part]) {
         delete state.config.widgetElementOffsets[key][part];
       }
+      if (key === 'header' && part === 'location') {
+        state.config.headerShowLocation = true;
+        state.config.showLocation = true;
+        ['toggleHeaderLocation', 'textTabToggleHeaderLocation', 'headerShowLocationToggle'].forEach((id) => {
+          const el = document.getElementById(id);
+          if (el) el.checked = true;
+        });
+      }
       window.syncInspectorWithSelectedElement(key, part);
       triggerRender();
-      showToast(`Reset position of ${part} in ${key}`);
+      showToast(`Reset ${part} in ${key} to default`);
+    });
+  }
+
+  const restoreTemplateBtn = document.getElementById('inspectorRestoreTemplateBtn');
+  if (restoreTemplateBtn) {
+    restoreTemplateBtn.addEventListener('click', () => {
+      restoreWidgetToTemplate(getActiveKey());
+    });
+  }
+
+  const deleteElementBtn = document.getElementById('inspectorDeleteElementBtn');
+  if (deleteElementBtn) {
+    deleteElementBtn.addEventListener('click', () => {
+      deleteSelectedTarget(getActiveKey());
+    });
+  }
+
+  const deleteBgBtn = document.getElementById('inspectorDeleteBgBtn');
+  if (deleteBgBtn) {
+    deleteBgBtn.addEventListener('click', () => {
+      deleteSelectedTarget(getActiveKey() + '_bg');
+    });
+  }
+
+  const bgShowBgToggle = document.getElementById('inspectorBgShowBgToggle');
+  if (bgShowBgToggle) {
+    bgShowBgToggle.addEventListener('change', (e) => {
+      pushUndoSnapshot();
+      const bg = getBgObj();
+      bg.showBg = e.target.checked;
+      if (e.target.checked) bg.textOnly = false;
+      triggerRender();
+    });
+  }
+
+  const bgShowBorderToggle = document.getElementById('inspectorBgShowBorderToggle');
+  if (bgShowBorderToggle) {
+    bgShowBorderToggle.addEventListener('change', (e) => {
+      pushUndoSnapshot();
+      const bg = getBgObj();
+      bg.showBorder = e.target.checked;
+      if (e.target.checked) bg.textOnly = false;
+      triggerRender();
+    });
+  }
+
+  const bgTextOnlyBtn = document.getElementById('inspectorBgTextOnlyBtn');
+  if (bgTextOnlyBtn) {
+    bgTextOnlyBtn.addEventListener('click', () => {
+      pushUndoSnapshot();
+      const key = getActiveKey();
+      const bg = getBgObj();
+      bg.textOnly = true;
+      bg.showBg = false;
+      bg.showBorder = false;
+      const st = getStyleObj();
+      st.cardStyle = 'text-only';
+      if (cardStyleSelect) cardStyleSelect.value = 'text-only';
+      if (bgShowBgToggle) bgShowBgToggle.checked = false;
+      if (bgShowBorderToggle) bgShowBorderToggle.checked = false;
+      triggerRender();
+      showToast(`Set ${key} to Text Only`);
+    });
+  }
+
+  const deleteSubElemBtn = document.getElementById('inspectorDeleteSubElemBtn');
+  if (deleteSubElemBtn) {
+    deleteSubElemBtn.addEventListener('click', () => {
+      const key = getActiveKey();
+      const part = subPartSelect ? subPartSelect.value : '';
+      if (!part || part === 'widget' || part === 'bg') {
+        deleteSelectedTarget(key);
+      } else {
+        pushUndoSnapshot();
+        const sub = getSubElemObj();
+        sub.hidden = true;
+        sub.visible = false;
+        triggerRender();
+        showToast(`Deleted / hid ${part} in ${key}`);
+      }
     });
   }
 
@@ -1673,6 +2710,33 @@ function setupTextAndStickersControls() {
   bindInput('textTabWeatherText', 'weatherText');
   bindInput('textTabSubtitle', 'customSubtitle');
   bindInput('textTabWatermark', 'customWatermark');
+
+  // Header Location Visibility Toggles
+  const bindHeaderLocToggle = (id) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.addEventListener('change', (e) => {
+      pushUndoSnapshot();
+      const val = e.target.checked;
+      state.config.headerShowLocation = val;
+      state.config.showLocation = val;
+      if (!state.config.widgetElementOffsets) state.config.widgetElementOffsets = {};
+      if (!state.config.widgetElementOffsets.header) state.config.widgetElementOffsets.header = {};
+      if (!state.config.widgetElementOffsets.header.location) state.config.widgetElementOffsets.header.location = { x: 0, y: 0, z: 1 };
+      state.config.widgetElementOffsets.header.location.hidden = !val;
+      state.config.widgetElementOffsets.header.location.visible = val;
+
+      ['toggleHeaderLocation', 'textTabToggleHeaderLocation', 'headerShowLocationToggle'].forEach((otherId) => {
+        const otherEl = document.getElementById(otherId);
+        if (otherEl && otherEl !== el) otherEl.checked = val;
+      });
+      triggerRender();
+      showToast(val ? 'Header location enabled' : 'Header location disabled');
+    });
+  };
+  bindHeaderLocToggle('toggleHeaderLocation');
+  bindHeaderLocToggle('textTabToggleHeaderLocation');
+  bindHeaderLocToggle('headerShowLocationToggle');
 
   // Custom Metric Labels
   bindInput('customLabelDistance', 'labelDistance');
@@ -1864,7 +2928,6 @@ function setupGizmoController() {
   const toggleLayoutBtn = document.getElementById('toggleInteractiveLayoutBtn');
   const resetAllBtn = document.getElementById('resetAllLayoutBtn');
   const gizmoCenterBtn = document.getElementById('gizmoCenterBtn');
-  const gizmoResetBtn = document.getElementById('gizmoResetBtn');
   const gizmoCloseBtn = document.getElementById('gizmoCloseBtn');
 
   if (toggleLayoutBtn) {
@@ -1879,8 +2942,13 @@ function setupGizmoController() {
 
   if (resetAllBtn) {
     resetAllBtn.addEventListener('click', () => {
+      pushUndoSnapshot();
       state.config.widgetPositions = {};
+      state.config.widgetBgStyles = {};
+      state.config.widgetElementOffsets = {};
+      state.config.elementStyles = {};
       selectWidget(null);
+      syncAllControlsWithConfig();
       triggerRender();
       showToast('All widgets reset to template default layout');
     });
@@ -1888,30 +2956,49 @@ function setupGizmoController() {
 
   if (gizmoCenterBtn) {
     gizmoCenterBtn.addEventListener('click', () => {
-      if (state.selectedWidget) centerWidget(state.selectedWidget);
+      if (state.selectedWidget === '__bg_photo__') {
+        pushUndoSnapshot();
+        state.config.photoPanX = 0;
+        state.config.photoPanY = 0;
+        syncPhotoSliders();
+        triggerRender();
+        showToast('Photo centered');
+      } else if (state.selectedWidget) {
+        pushUndoSnapshot();
+        centerWidget(state.selectedWidget);
+      }
     });
   }
 
-  if (gizmoResetBtn) {
-    gizmoResetBtn.addEventListener('click', () => {
-      if (state.selectedWidget) {
-        delete state.config.widgetPositions[state.selectedWidget];
+  const gizmoRestoreBtn = document.getElementById('gizmoRestoreBtn');
+  if (gizmoRestoreBtn) {
+    gizmoRestoreBtn.addEventListener('click', () => {
+      if (state.selectedWidget === '__bg_photo__') {
+        pushUndoSnapshot();
+        state.config.photoZoom = 1;
+        state.config.photoPanX = 0;
+        state.config.photoPanY = 0;
+        state.config.photoFit = 'fit';
+        syncPhotoSliders();
         triggerRender();
-        showToast('Widget reset to template default');
+        showToast('Photo reset to default');
+      } else if (state.selectedWidget) {
+        restoreWidgetToTemplate(state.selectedWidget);
       }
     });
   }
 
   if (gizmoDeleteBtn) {
     gizmoDeleteBtn.addEventListener('click', () => {
-      if (!state.selectedWidget) return;
-      const cIdx = state.config.customTexts.findIndex((t) => t.id === state.selectedWidget);
-      if (cIdx !== -1) {
-        state.config.customTexts.splice(cIdx, 1);
+      if (state.selectedWidget === '__bg_photo__') {
+        pushUndoSnapshot();
+        state.config.bgType = 'solid';
         selectWidget(null);
-        renderCustomTextsList();
+        syncAllControlsWithConfig();
         triggerRender();
-        showToast('Sticker deleted');
+        showToast('Background photo removed');
+      } else if (state.selectedWidget) {
+        deleteSelectedTarget(state.selectedWidget);
       }
     });
   }
@@ -1948,6 +3035,7 @@ function setupGizmoController() {
     const entries = Object.entries(bounds).reverse();
 
     for (const [key, b] of entries) {
+      if (key === '__bg_photo__') continue; // Don't let background photo steal clicks from widgets
       if (clickX >= b.x && clickX <= b.x + b.width && clickY >= b.y && clickY <= b.y + b.height) {
         foundKey = key;
         break;
@@ -1958,7 +3046,12 @@ function setupGizmoController() {
       selectWidget(foundKey);
       startDragMove(clientX, clientY);
     } else {
-      selectWidget(null);
+      if (state.config.bgType === 'photo' && renderer.bgImage) {
+        selectWidget('__bg_photo__');
+        startPhotoDrag(clientX, clientY);
+      } else {
+        selectWidget(null);
+      }
     }
   };
 
@@ -1973,24 +3066,89 @@ function setupGizmoController() {
     }
   }, { passive: false });
 
+  // Helper to test if clicking/tapping a foreground widget when background photo is selected
+  const handleGizmoPointerDown = (clientX, clientY) => {
+    if (state.selectedWidget === '__bg_photo__') {
+      const rect = canvas.getBoundingClientRect();
+      const scale = canvas.width / rect.width;
+      const clickX = (clientX - rect.left) * scale;
+      const clickY = (clientY - rect.top) * scale;
+
+      let foundKey = null;
+      const bounds = renderer.widgetBounds || {};
+      const entries = Object.entries(bounds).reverse();
+
+      for (const [key, b] of entries) {
+        if (key === '__bg_photo__') continue;
+        if (clickX >= b.x && clickX <= b.x + b.width && clickY >= b.y && clickY <= b.y + b.height) {
+          foundKey = key;
+          break;
+        }
+      }
+
+      if (foundKey) {
+        selectWidget(foundKey);
+        startDragMove(clientX, clientY);
+        return;
+      }
+      startPhotoDrag(clientX, clientY);
+    } else {
+      startDragMove(clientX, clientY);
+    }
+  };
+
   // Gizmo Body Move Drag
   gizmoBox.addEventListener('mousedown', (e) => {
     if (e.target.classList.contains('gizmo-handle') || e.target.tagName === 'BUTTON' || e.target.tagName === 'SELECT') return;
-    if (e.button === 0) startDragMove(e.clientX, e.clientY);
+    if (e.button === 0) {
+      handleGizmoPointerDown(e.clientX, e.clientY);
+    }
   });
 
   gizmoBox.addEventListener('touchstart', (e) => {
     if (e.target.classList.contains('gizmo-handle') || e.target.tagName === 'BUTTON' || e.target.tagName === 'SELECT') return;
     if (e.touches.length === 1) {
-      const t = e.touches[0];
-      startDragMove(t.clientX, t.clientY);
+      handleGizmoPointerDown(e.touches[0].clientX, e.touches[0].clientY);
     }
   }, { passive: false });
+
+  // Hover cursor for background photo gizmo
+  gizmoBox.addEventListener('mousemove', (e) => {
+    if (isInteracting) return;
+    if (state.selectedWidget === '__bg_photo__') {
+      if (e.target.classList.contains('gizmo-handle') || e.target.tagName === 'BUTTON' || e.target.tagName === 'SELECT') return;
+      const rect = canvas.getBoundingClientRect();
+      const scale = canvas.width / rect.width;
+      const clickX = (e.clientX - rect.left) * scale;
+      const clickY = (e.clientY - rect.top) * scale;
+
+      let overForeground = false;
+      const bounds = renderer.widgetBounds || {};
+      for (const [key, b] of Object.entries(bounds)) {
+        if (key === '__bg_photo__') continue;
+        if (clickX >= b.x && clickX <= b.x + b.width && clickY >= b.y && clickY <= b.y + b.height) {
+          overForeground = true;
+          break;
+        }
+      }
+      gizmoBox.style.cursor = overForeground ? 'pointer' : 'grab';
+    }
+  });
 
   // Handles Resize Drag
   const handles = gizmoBox.querySelectorAll('.gizmo-handle');
   handles.forEach((h) => {
     const startResize = (clientX, clientY) => {
+      pushUndoSnapshot();
+      if (state.selectedWidget === '__bg_photo__') {
+        activeDragMode = 'photo_zoom';
+        dragStartX = clientX;
+        dragStartY = clientY;
+        dragInitialZoom = typeof state.config.photoZoom === 'number' ? state.config.photoZoom : 1;
+        isInteracting = true;
+        return;
+      }
+
       activeDragMode = 'resize';
       activeHandle = h.dataset.handle;
       dragStartX = clientX;
@@ -2038,6 +3196,22 @@ function setupGizmoController() {
     const scale = canvas.width / rect.width;
     const deltaX = (clientX - dragStartX) * scale;
     const deltaY = (clientY - dragStartY) * scale;
+
+    if (activeDragMode === 'photo') {
+      const deltaPercentX = (deltaX / canvas.width) * 100;
+      const deltaPercentY = (deltaY / canvas.height) * 100;
+      state.config.photoPanX = Math.round((dragInitialPanX + deltaPercentX) * 10) / 10;
+      state.config.photoPanY = Math.round((dragInitialPanY + deltaPercentY) * 10) / 10;
+      syncPhotoSliders();
+      triggerRender();
+      return;
+    } else if (activeDragMode === 'photo_zoom') {
+      const deltaZoom = (deltaX + deltaY) * 0.003;
+      state.config.photoZoom = Math.max(0.1, Math.min(5.0, Math.round((dragInitialZoom + deltaZoom) * 100) / 100));
+      syncPhotoSliders();
+      triggerRender();
+      return;
+    }
 
     if (activeDragMode === 'move') {
       if (state.selectedWidget.endsWith('_bg')) {
@@ -2104,6 +3278,45 @@ function setupGizmoController() {
     }
   };
 
+  // Canvas Hover Cursor for Interactive Layout
+  canvas.addEventListener('mousemove', (e) => {
+    if (!state.isInteractiveLayout || isInteracting) return;
+    const rect = canvas.getBoundingClientRect();
+    const scale = canvas.width / rect.width;
+    const hoverX = (e.clientX - rect.left) * scale;
+    const hoverY = (e.clientY - rect.top) * scale;
+    let hoveredWidget = null;
+    const bounds = renderer.widgetBounds || {};
+    for (const [key, b] of Object.entries(bounds).reverse()) {
+      if (key === '__bg_photo__') continue;
+      if (hoverX >= b.x && hoverX <= b.x + b.width && hoverY >= b.y && hoverY <= b.y + b.height) {
+        hoveredWidget = key;
+        break;
+      }
+    }
+    if (hoveredWidget) {
+      canvas.style.cursor = 'move';
+    } else if (state.config.bgType === 'photo' && renderer.bgImage) {
+      canvas.style.cursor = 'grab';
+    } else {
+      canvas.style.cursor = 'default';
+    }
+  });
+
+  // Canvas Mouse Wheel for Photo Zoom
+  canvas.addEventListener('wheel', (e) => {
+    if (state.config.bgType === 'photo' && renderer.bgImage) {
+      if (e.altKey || e.ctrlKey || state.selectedWidget === '__bg_photo__') {
+        e.preventDefault();
+        const zoomDelta = e.deltaY < 0 ? 0.05 : -0.05;
+        const curZoom = typeof state.config.photoZoom === 'number' ? state.config.photoZoom : 1;
+        state.config.photoZoom = Math.max(0.1, Math.min(5.0, Math.round((curZoom + zoomDelta) * 100) / 100));
+        syncPhotoSliders();
+        triggerRender();
+      }
+    }
+  }, { passive: false });
+
   window.addEventListener('mousemove', (e) => handlePointerMove(e.clientX, e.clientY));
   window.addEventListener('touchmove', (e) => {
     if (isInteracting && e.touches.length > 0) {
@@ -2116,7 +3329,18 @@ function setupGizmoController() {
   window.addEventListener('touchend', handlePointerUp);
 }
 
+function startPhotoDrag(clientX, clientY) {
+  pushUndoSnapshot();
+  activeDragMode = 'photo';
+  dragStartX = clientX;
+  dragStartY = clientY;
+  dragInitialPanX = typeof state.config.photoPanX === 'number' ? state.config.photoPanX : 0;
+  dragInitialPanY = typeof state.config.photoPanY === 'number' ? state.config.photoPanY : 0;
+  isInteracting = true;
+}
+
 function startDragMove(clientX, clientY) {
+  pushUndoSnapshot();
   activeDragMode = 'move';
   dragStartX = clientX;
   dragStartY = clientY;
@@ -2152,6 +3376,16 @@ function selectWidget(key) {
   const nameLabel = document.getElementById('selectedWidgetNameLabel');
   if (!key) {
     if (nameLabel) nameLabel.textContent = 'None (Click canvas)';
+    return;
+  }
+
+  if (key === '__bg_photo__') {
+    if (nameLabel) nameLabel.textContent = 'Background Photo';
+    const photoSection = document.getElementById('photoControlsSection');
+    if (photoSection) photoSection.style.display = 'block';
+    const inspectorSelect = document.getElementById('inspectorElementSelect');
+    if (inspectorSelect) inspectorSelect.value = '__bg_photo__';
+    updateGizmoBox();
     return;
   }
 
@@ -2207,9 +3441,11 @@ function updateGizmoBox() {
     return;
   }
 
+  const isPhoto = state.selectedWidget === '__bg_photo__';
   const isBgBorder = state.selectedWidget && state.selectedWidget.endsWith('_bg');
   const gizmoSubPartSelect = document.getElementById('gizmoSubPartSelect');
   if (gizmoSubPartSelect) {
+    gizmoSubPartSelect.style.display = isPhoto ? 'none' : '';
     gizmoSubPartSelect.value = isBgBorder ? 'border' : 'widget';
   }
   if (isBgBorder) {
@@ -2237,12 +3473,15 @@ function updateGizmoBox() {
   gizmoBox.style.height = `${cssHeight}px`;
 
   if (gizmoTitle) {
-    gizmoTitle.textContent = `${b.name} (${b.width}×${b.height})`;
+    if (isPhoto) {
+      gizmoTitle.textContent = `🖼️ Photo (${b.width}×${b.height}) - Pan: ${state.config.photoPanX || 0}%, ${state.config.photoPanY || 0}%`;
+    } else {
+      gizmoTitle.textContent = `${b.name} (${b.width}×${b.height})`;
+    }
   }
 
   if (gizmoDeleteBtn) {
-    const isCustomText = state.config.customTexts.some((t) => t.id === state.selectedWidget);
-    gizmoDeleteBtn.style.display = isCustomText ? 'inline-flex' : 'none';
+    gizmoDeleteBtn.style.display = 'inline-flex';
   }
 }
 
@@ -2256,6 +3495,75 @@ function centerWidget(key) {
   showToast('Centered widget horizontally');
 }
 
+function syncPhotoSliders() {
+  const cfg = state.config;
+  const zoom = typeof cfg.photoZoom === 'number' ? cfg.photoZoom : 1;
+  const panX = typeof cfg.photoPanX === 'number' ? cfg.photoPanX : 0;
+  const panY = typeof cfg.photoPanY === 'number' ? cfg.photoPanY : 0;
+  const blur = typeof cfg.photoBlur === 'number' ? cfg.photoBlur : 0;
+  const brightness = typeof cfg.photoBrightness === 'number' ? cfg.photoBrightness : 100;
+  const contrast = typeof cfg.photoContrast === 'number' ? cfg.photoContrast : 100;
+  const fit = cfg.photoFit || 'fit';
+  const backdrop = cfg.photoBackdrop || 'blur';
+
+  const zoomSlider = document.getElementById('photoZoom');
+  const zoomInput = document.getElementById('photoZoomInput');
+  const zoomVal = document.getElementById('photoZoomVal');
+  if (zoomSlider) zoomSlider.value = zoom;
+  if (zoomInput) zoomInput.value = zoom;
+  if (zoomVal) zoomVal.textContent = `${zoom.toFixed(2)}x`;
+
+  const panXSlider = document.getElementById('photoPanX');
+  const panXInput = document.getElementById('photoPanXInput');
+  const panXVal = document.getElementById('photoPanXVal');
+  if (panXSlider) panXSlider.value = panX;
+  if (panXInput) panXInput.value = panX;
+  if (panXVal) panXVal.textContent = `${panX}%`;
+
+  const panYSlider = document.getElementById('photoPanY');
+  const panYInput = document.getElementById('photoPanYInput');
+  const panYVal = document.getElementById('photoPanYVal');
+  if (panYSlider) panYSlider.value = panY;
+  if (panYInput) panYInput.value = panY;
+  if (panYVal) panYVal.textContent = `${panY}%`;
+
+  const blurSlider = document.getElementById('photoBlur');
+  const blurVal = document.getElementById('photoBlurVal');
+  if (blurSlider) blurSlider.value = blur;
+  if (blurVal) blurVal.textContent = `${blur}px`;
+
+  const brightSlider = document.getElementById('photoBrightness');
+  const brightVal = document.getElementById('photoBrightnessVal');
+  if (brightSlider) brightSlider.value = brightness;
+  if (brightVal) brightVal.textContent = `${brightness}%`;
+
+  const contrastSlider = document.getElementById('photoContrast');
+  const contrastVal = document.getElementById('photoContrastVal');
+  if (contrastSlider) contrastSlider.value = contrast;
+  if (contrastVal) contrastVal.textContent = `${contrast}%`;
+
+  const fitBtn = document.getElementById('photoFitBtn');
+  const coverBtn = document.getElementById('photoCoverBtn');
+  const fitBadge = document.getElementById('photoFitBadge');
+  const ratioBadge = document.getElementById('photoRatioStatusBadge');
+  if (fitBtn && coverBtn) {
+    fitBtn.classList.toggle('active', fit === 'fit' || fit === 'contain');
+    coverBtn.classList.toggle('active', fit === 'cover');
+  }
+  if (fitBadge) {
+    fitBadge.textContent = (fit === 'fit' || fit === 'contain') ? '100% Uncropped' : 'Fill Canvas';
+  }
+  if (ratioBadge) {
+    ratioBadge.textContent = (fit === 'fit' || fit === 'contain') ? 'No Crop Mode' : 'Cover Mode';
+  }
+
+  const backdropSelect = document.getElementById('photoBackdropSelect');
+  if (backdropSelect) backdropSelect.value = backdrop;
+
+  const protectToggle = document.getElementById('togglePhotoProtection');
+  if (protectToggle) protectToggle.checked = cfg.photoProtectionGradient !== false;
+}
+
 // ==========================================
 // 8. STYLE & BACKGROUND CONTROLS
 // ==========================================
@@ -2264,63 +3572,230 @@ function setupStyleControls() {
   const bgPhotoInput = document.getElementById('bgPhotoInput');
 
   setupCardGrid('#bgTypeGrid', 'data-bg', (bg) => {
+    pushUndoSnapshot();
     state.config.bgType = bg;
     if (bg === 'photo') {
       photoSection.style.display = 'block';
     } else {
       photoSection.style.display = 'none';
+      if (state.selectedWidget === '__bg_photo__') selectWidget(null);
     }
     triggerRender();
   });
 
-  bgPhotoInput.addEventListener('change', (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
+  if (bgPhotoInput) {
+    bgPhotoInput.addEventListener('change', (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
 
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      const img = new Image();
-      img.onload = () => {
-        renderer.setBgImage(img);
-        state.config.bgType = 'photo';
-        photoSection.style.display = 'block';
-        updateActiveCard('#bgTypeGrid', 'data-bg', 'photo');
-        triggerRender();
-        showToast('Background photo loaded!');
+      const reader = new FileReader();
+      reader.onload = (event) => {
+        const img = new Image();
+        img.onload = () => {
+          pushUndoSnapshot();
+          renderer.setBgImage(img);
+          state.config.bgType = 'photo';
+
+          // Detect aspect ratio difference:
+          const imgAspect = img.width / img.height;
+          const [rw, rh] = (state.config.aspectRatio || '9:16').split(':').map(Number);
+          const canvasAspect = (rw && rh) ? rw / rh : 9 / 16;
+          const isRatioSimilar = Math.abs(imgAspect - canvasAspect) / Math.max(imgAspect, canvasAspect) < 0.05;
+
+          // If ratio is not similar, default to 'fit' (contain) so no unseen part is cropped!
+          if (!isRatioSimilar) {
+            state.config.photoFit = 'fit';
+          }
+          state.config.photoPanX = 0;
+          state.config.photoPanY = 0;
+          state.config.photoZoom = 1;
+
+          photoSection.style.display = 'block';
+          updateActiveCard('#bgTypeGrid', 'data-bg', 'photo');
+          syncPhotoSliders();
+          triggerRender();
+          showToast('Background photo loaded (100% full uncropped image)!');
+        };
+        img.src = event.target.result;
       };
-      img.src = event.target.result;
-    };
-    reader.readAsDataURL(file);
-  });
+      reader.readAsDataURL(file);
+    });
+  }
 
-  document.getElementById('resetPhotoPosBtn').addEventListener('click', () => {
-    state.config.photoZoom = 1;
-    state.config.photoPanX = 0;
-    state.config.photoPanY = 0;
-    document.getElementById('photoZoom').value = 1;
-    document.getElementById('photoPanX').value = 0;
-    document.getElementById('photoPanY').value = 0;
-    document.getElementById('photoZoomVal').textContent = '1x';
-    document.getElementById('photoPanXVal').textContent = '0%';
-    document.getElementById('photoPanYVal').textContent = '0%';
-    triggerRender();
-  });
+  // Ratio & Fit Mode Buttons
+  const photoFitBtn = document.getElementById('photoFitBtn');
+  if (photoFitBtn) {
+    photoFitBtn.addEventListener('click', () => {
+      pushUndoSnapshot();
+      state.config.photoFit = 'fit';
+      syncPhotoSliders();
+      triggerRender();
+      showToast('Photo Fit: 100% full uncropped photo');
+    });
+  }
 
-  setupSlider('photoZoom', 'photoZoomVal', (val) => {
-    state.config.photoZoom = parseFloat(val);
-    triggerRender();
-  }, 'x');
+  const photoCoverBtn = document.getElementById('photoCoverBtn');
+  if (photoCoverBtn) {
+    photoCoverBtn.addEventListener('click', () => {
+      pushUndoSnapshot();
+      state.config.photoFit = 'cover';
+      syncPhotoSliders();
+      triggerRender();
+      showToast('Photo Fit: Fill frame');
+    });
+  }
 
-  setupSlider('photoPanX', 'photoPanXVal', (val) => {
-    state.config.photoPanX = parseFloat(val);
-    triggerRender();
-  }, '%');
+  // Margin Backdrop Select
+  const photoBackdropSelect = document.getElementById('photoBackdropSelect');
+  if (photoBackdropSelect) {
+    photoBackdropSelect.addEventListener('change', (e) => {
+      pushUndoSnapshot();
+      state.config.photoBackdrop = e.target.value;
+      triggerRender();
+    });
+  }
 
-  setupSlider('photoPanY', 'photoPanYVal', (val) => {
-    state.config.photoPanY = parseFloat(val);
-    triggerRender();
-  }, '%');
+  // Pan X slider & number input
+  const photoPanX = document.getElementById('photoPanX');
+  const photoPanXInput = document.getElementById('photoPanXInput');
+  if (photoPanX) {
+    photoPanX.addEventListener('input', (e) => {
+      state.config.photoPanX = parseFloat(e.target.value) || 0;
+      if (photoPanXInput) photoPanXInput.value = state.config.photoPanX;
+      const panXVal = document.getElementById('photoPanXVal');
+      if (panXVal) panXVal.textContent = `${state.config.photoPanX}%`;
+      triggerRender();
+    });
+    photoPanX.addEventListener('change', () => pushUndoSnapshot());
+  }
+  if (photoPanXInput) {
+    photoPanXInput.addEventListener('input', (e) => {
+      state.config.photoPanX = parseFloat(e.target.value) || 0;
+      if (photoPanX) photoPanX.value = state.config.photoPanX;
+      const panXVal = document.getElementById('photoPanXVal');
+      if (panXVal) panXVal.textContent = `${state.config.photoPanX}%`;
+      triggerRender();
+    });
+    photoPanXInput.addEventListener('change', () => pushUndoSnapshot());
+  }
 
+  // Pan Y slider & number input
+  const photoPanY = document.getElementById('photoPanY');
+  const photoPanYInput = document.getElementById('photoPanYInput');
+  if (photoPanY) {
+    photoPanY.addEventListener('input', (e) => {
+      state.config.photoPanY = parseFloat(e.target.value) || 0;
+      if (photoPanYInput) photoPanYInput.value = state.config.photoPanY;
+      const panYVal = document.getElementById('photoPanYVal');
+      if (panYVal) panYVal.textContent = `${state.config.photoPanY}%`;
+      triggerRender();
+    });
+    photoPanY.addEventListener('change', () => pushUndoSnapshot());
+  }
+  if (photoPanYInput) {
+    photoPanYInput.addEventListener('input', (e) => {
+      state.config.photoPanY = parseFloat(e.target.value) || 0;
+      if (photoPanY) photoPanY.value = state.config.photoPanY;
+      const panYVal = document.getElementById('photoPanYVal');
+      if (panYVal) panYVal.textContent = `${state.config.photoPanY}%`;
+      triggerRender();
+    });
+    photoPanYInput.addEventListener('change', () => pushUndoSnapshot());
+  }
+
+  // Directional Nudge Buttons
+  const photoNudgeLeftBtn = document.getElementById('photoNudgeLeftBtn');
+  if (photoNudgeLeftBtn) {
+    photoNudgeLeftBtn.addEventListener('click', () => {
+      pushUndoSnapshot();
+      state.config.photoPanX = Math.round(((state.config.photoPanX || 0) - 5) * 10) / 10;
+      syncPhotoSliders();
+      triggerRender();
+    });
+  }
+
+  const photoNudgeRightBtn = document.getElementById('photoNudgeRightBtn');
+  if (photoNudgeRightBtn) {
+    photoNudgeRightBtn.addEventListener('click', () => {
+      pushUndoSnapshot();
+      state.config.photoPanX = Math.round(((state.config.photoPanX || 0) + 5) * 10) / 10;
+      syncPhotoSliders();
+      triggerRender();
+    });
+  }
+
+  const photoNudgeUpBtn = document.getElementById('photoNudgeUpBtn');
+  if (photoNudgeUpBtn) {
+    photoNudgeUpBtn.addEventListener('click', () => {
+      pushUndoSnapshot();
+      state.config.photoPanY = Math.round(((state.config.photoPanY || 0) - 5) * 10) / 10;
+      syncPhotoSliders();
+      triggerRender();
+    });
+  }
+
+  const photoNudgeDownBtn = document.getElementById('photoNudgeDownBtn');
+  if (photoNudgeDownBtn) {
+    photoNudgeDownBtn.addEventListener('click', () => {
+      pushUndoSnapshot();
+      state.config.photoPanY = Math.round(((state.config.photoPanY || 0) + 5) * 10) / 10;
+      syncPhotoSliders();
+      triggerRender();
+    });
+  }
+
+  const photoCenterBtn = document.getElementById('photoCenterBtn');
+  if (photoCenterBtn) {
+    photoCenterBtn.addEventListener('click', () => {
+      pushUndoSnapshot();
+      state.config.photoPanX = 0;
+      state.config.photoPanY = 0;
+      syncPhotoSliders();
+      triggerRender();
+      showToast('Photo centered');
+    });
+  }
+
+  // Reset Photo Button
+  const resetPhotoPosBtn = document.getElementById('resetPhotoPosBtn');
+  if (resetPhotoPosBtn) {
+    resetPhotoPosBtn.addEventListener('click', () => {
+      pushUndoSnapshot();
+      state.config.photoZoom = 1;
+      state.config.photoPanX = 0;
+      state.config.photoPanY = 0;
+      state.config.photoFit = 'fit';
+      syncPhotoSliders();
+      triggerRender();
+      showToast('Photo reset to default');
+    });
+  }
+
+  // Zoom slider & input
+  const photoZoom = document.getElementById('photoZoom');
+  const photoZoomInput = document.getElementById('photoZoomInput');
+  if (photoZoom) {
+    photoZoom.addEventListener('input', (e) => {
+      state.config.photoZoom = parseFloat(e.target.value) || 1;
+      if (photoZoomInput) photoZoomInput.value = state.config.photoZoom;
+      const zoomVal = document.getElementById('photoZoomVal');
+      if (zoomVal) zoomVal.textContent = `${state.config.photoZoom.toFixed(2)}x`;
+      triggerRender();
+    });
+    photoZoom.addEventListener('change', () => pushUndoSnapshot());
+  }
+  if (photoZoomInput) {
+    photoZoomInput.addEventListener('input', (e) => {
+      state.config.photoZoom = parseFloat(e.target.value) || 1;
+      if (photoZoom) photoZoom.value = state.config.photoZoom;
+      const zoomVal = document.getElementById('photoZoomVal');
+      if (zoomVal) zoomVal.textContent = `${state.config.photoZoom.toFixed(2)}x`;
+      triggerRender();
+    });
+    photoZoomInput.addEventListener('change', () => pushUndoSnapshot());
+  }
+
+  // Blur, Brightness, Contrast & Protection
   setupSlider('photoBlur', 'photoBlurVal', (val) => {
     state.config.photoBlur = parseFloat(val);
     triggerRender();
@@ -2331,10 +3806,19 @@ function setupStyleControls() {
     triggerRender();
   }, '%');
 
-  document.getElementById('togglePhotoProtection').addEventListener('change', (e) => {
-    state.config.photoProtectionGradient = e.target.checked;
+  setupSlider('photoContrast', 'photoContrastVal', (val) => {
+    state.config.photoContrast = parseFloat(val);
     triggerRender();
-  });
+  }, '%');
+
+  const togglePhotoProtection = document.getElementById('togglePhotoProtection');
+  if (togglePhotoProtection) {
+    togglePhotoProtection.addEventListener('change', (e) => {
+      pushUndoSnapshot();
+      state.config.photoProtectionGradient = e.target.checked;
+      triggerRender();
+    });
+  }
 
   setupCardGrid('#themeGrid', 'data-theme', (theme) => {
     state.config.theme = theme;
